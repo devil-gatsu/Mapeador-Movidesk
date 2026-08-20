@@ -4,7 +4,6 @@ import threading
 import time
 import os
 import re
-import json
 import pandas as pd
 from playwright.sync_api import sync_playwright
 
@@ -19,13 +18,10 @@ def executar_fase1(cookie_val, status_label):
     status_label.config(text="Status: [Fase 1] Conectando ao Movidesk...", fg="orange")
     
     try:
-        dados_capturados_rede = []
-
         with sync_playwright() as p:
             browser = p.chromium.launch(channel="chrome", headless=True, args=["--start-maximized"])
             context = browser.new_context(viewport={"width": 1920, "height": 1080})
             
-            # Injeta o cookie no subdomínio e no domínio raiz
             context.add_cookies([
                 {"name": ".ASPXAUTH", "value": cookie_val.strip(), "domain": "omne.movidesk.com", "path": "/"},
                 {"name": ".ASPXAUTH", "value": cookie_val.strip(), "domain": ".movidesk.com", "path": "/"}
@@ -33,165 +29,92 @@ def executar_fase1(cookie_val, status_label):
             
             page = context.new_page()
 
-            # Interceptador de respostas JSON da API do Movidesk
-            def interceptar_resposta(response):
-                try:
-                    if "customfield" in response.url.lower() or "field" in response.url.lower():
-                        content_type = response.headers.get("content-type", "")
-                        if "application/json" in content_type:
-                            data = response.json()
-                            lista = []
-                            if isinstance(data, list):
-                                lista = data
-                            elif isinstance(data, dict):
-                                for k in ["data", "items", "rows", "CustomFields", "Result", "Data"]:
-                                    if k in data and isinstance(data[k], list):
-                                        lista = data[k]
-                                        break
-                            
-                            for item in lista:
-                                if isinstance(item, dict):
-                                    c_id = str(item.get("id") or item.get("Id") or item.get("customFieldId") or "")
-                                    c_nome = str(item.get("name") or item.get("Name") or item.get("description") or item.get("Description") or "")
-                                    c_tipo = str(item.get("fieldTypeDescription") or item.get("typeDescription") or item.get("fieldType") or item.get("Type") or item.get("tipo") or "Personalizado")
-                                    if c_nome:
-                                        dados_capturados_rede.append({"Id": c_id, "Nome": c_nome, "Tipo": c_tipo, "Regra de exibição": ""})
-                except Exception:
-                    pass
-
-            page.on("response", interceptar_resposta)
-
             status_label.config(text="Status: [Fase 1] Acessando tela de Campos...", fg="orange")
-            
-            # URL Corrigida conforme sua instrução
             page.goto(f"{BASE_URL}/CustomField", timeout=60000)
-            page.wait_for_load_state("networkidle")
             
-            if "login" in page.url.lower():
-                raise Exception("Sessão expirada ou Cookie inválido. O Movidesk redirecionou para o login.")
+            # 1. Espera cirúrgica baseada na sua imagem ("Exibindo de 1 até...")
+            status_label.config(text="Status: [Fase 1] Aguardando a tabela aparecer...", fg="orange")
+            try:
+                # O robô agora espera ESSE texto aparecer para ter certeza que carregou
+                page.locator("text=total de").wait_for(state="visible", timeout=30000)
+            except Exception:
+                raise Exception("A página carregou, mas a lista de campos não apareceu. Verifique o cookie.")
 
-            time.sleep(4)
-            status_label.config(text="Status: [Fase 1] Identificando total e rolando tabela...", fg="orange")
-
-            # Busca total de registros no texto da página
+            # 2. Descobre o total de registros lendo o texto do cabeçalho
             total_registros = 1292
             try:
-                texto_pagina = page.locator("body").inner_text()
-                match = re.search(r'total de\s+(\d+)', texto_pagina, re.IGNORECASE)
+                texto_paginacao = page.locator("text=total de").first.inner_text()
+                match = re.search(r'total de (\d+)', texto_paginacao, re.IGNORECASE)
                 if match:
                     total_registros = int(match.group(1))
-            except Exception:
+            except:
                 pass
 
-            # Rola a página e todos os contêineres internos de scroll
+            status_label.config(text=f"Status: [Fase 1] Rolando {total_registros} campos internamente...", fg="orange")
+
+            # 3. Lógica de scroll INTERNO da tabela (foca no contêiner com a barra)
             ultimo_count = 0
             tentativas_paradas = 0
 
-            for _ in range(60):
+            for _ in range(100):
+                # O comando JS agora mira explicitamente em áreas roláveis internas, como o k-grid-content do Movidesk
                 page.evaluate("""() => {
-                    window.scrollTo(0, document.body.scrollHeight);
-                    document.querySelectorAll('div, section, main').forEach(el => {
-                        if (el.scrollHeight > el.clientHeight) {
-                            el.scrollTop = el.scrollHeight;
-                        }
-                    });
+                    let grid = document.querySelector('.k-grid-content') || 
+                               document.querySelector('.table-responsive') || 
+                               document.querySelector('table').parentElement;
+                    if(grid) {
+                        grid.scrollTop = grid.scrollHeight;
+                    }
                 }""")
-                page.keyboard.press("End")
-                page.keyboard.press("PageDown")
-                time.sleep(1.2)
-
-                linhas_atuais = page.locator("table tbody tr, .k-grid-content tr, tr").count()
+                time.sleep(1.5)
+                
+                linhas_atuais = page.locator("table tbody tr").count()
+                
                 if linhas_atuais >= total_registros:
                     break
-                
+                    
                 if linhas_atuais == ultimo_count:
                     tentativas_paradas += 1
-                    if tentativas_paradas >= 8:
+                    if tentativas_paradas >= 6: # Se a tabela parar de crescer, encerra o loop
                         break
                 else:
                     tentativas_paradas = 0
                     ultimo_count = linhas_atuais
 
-            status_label.config(text="Status: [Fase 1] Extraindo dados da tela...", fg="orange")
+            status_label.config(text="Status: [Fase 1] Extraindo colunas...", fg="orange")
 
-            # Varredura DOM com fallback resiliente
-            dados_dom = []
-            linhas = page.locator("tr").all()
+            # 4. Extração exata baseada na estrutura da sua imagem
+            dados_campos = []
+            linhas = page.locator("table tbody tr").all()
 
-            for idx_linha, linha in enumerate(linhas):
-                tds = linha.locator("td").all()
-                if len(tds) < 2:
-                    continue
-
-                textos = [td.inner_text().strip() for td in tds]
-                textos_uteis = [t for t in textos if t and t not in ["-", "Sim", "Não", "Ativo", "Inativo", "Ativos", "Inativos"]]
-
-                if not textos_uteis:
-                    continue
-
-                # 1. Tenta pegar o ID via Link de Edição (href)
-                c_id = ""
-                links = linha.locator("a").all()
-                for lk in links:
-                    href = lk.get_attribute("href") or ""
-                    match_id = re.search(r'/(\d+)(?:\?|$|/)', href)
-                    if match_id:
-                        c_id = match_id.group(1)
-                        break
-
-                # 2. Tenta pegar o ID em atributos da linha
-                if not c_id:
-                    for attr in ["data-id", "id", "data-uid"]:
-                        val = linha.get_attribute(attr) or ""
-                        if val.isdigit():
-                            c_id = val
-                            break
-
-                # 3. Tenta localizar nas células de texto
-                if not c_id:
-                    for t in textos_uteis:
-                        if t.isdigit():
-                            c_id = t
-                            break
-
-                # Extrai Nome e Tipo
-                c_nome = ""
-                c_tipo = "Personalizado"
-
-                textos_sem_id = [t for t in textos_uteis if t != c_id]
+            for linha in linhas:
+                colunas = linha.locator("td").all()
                 
-                if len(textos_sem_id) >= 1:
-                    c_nome = textos_sem_id[0]
-                if len(textos_sem_id) >= 2:
-                    c_tipo = textos_sem_id[1]
+                # A imagem mostra que existem várias colunas. Precisamos de pelo menos 4 (Check, ID, Nome, Tipo)
+                if len(colunas) >= 4:
+                    c_id = colunas[1].inner_text().strip()
+                    c_nome = colunas[2].inner_text().strip()
+                    c_tipo = colunas[3].inner_text().strip()
 
-                if not c_id:
-                    c_id = str(idx_linha)
-
-                if c_nome and c_nome.lower() not in ["nome", "tipo", "ações", "status"]:
-                    dados_dom.append({
-                        "Id": c_id,
-                        "Nome": c_nome,
-                        "Tipo": c_tipo,
-                        "Regra de exibição": ""
-                    })
+                    # Só salva se a coluna de ID realmente for um número (evita cabeçalhos perdidos)
+                    if c_id.isdigit():
+                        dados_campos.append({
+                            "Id": c_id,
+                            "Nome": c_nome,
+                            "Tipo": c_tipo,
+                            "Regra de exibição": ""
+                        })
 
             browser.close()
 
-            # Consolidação: Prefere dados da API se capturados, senão usa DOM
-            if len(dados_capturados_rede) > len(dados_dom):
-                dados_finais = dados_capturados_rede
-            else:
-                dados_finais = dados_dom
+            if not dados_campos:
+                raise Exception("Nenhum dado capturado. A tabela foi encontrada, mas não foi possível ler as colunas de ID e Nome.")
 
-            if not dados_finais:
-                raise Exception("A tabela carregou, mas os campos não foram identificados. Verifique se a página é a de Campos Adicionais.")
-
-            df = pd.DataFrame(dados_finais).drop_duplicates(subset=["Nome"])
+            df = pd.DataFrame(dados_campos).drop_duplicates(subset=["Id"])
             df.to_excel(EXCEL_FILE, index=False)
 
             status_label.config(text=f"Status: [Fase 1] Concluído! {len(df)} campos salvos.", fg="green")
-            messagebox.showinfo("Sucesso", f"Fase 1 finalizada!\n{len(df)} campos registrados em {EXCEL_FILE}.")
+            messagebox.showinfo("Sucesso", f"Fase 1 finalizada com sucesso!\n{len(df)} registros salvos em {EXCEL_FILE}.")
 
     except Exception as e:
         status_label.config(text="Status: Erro na Fase 1.", fg="red")
@@ -227,23 +150,21 @@ def executar_fase2(cookie_val, status_label):
             page = context.new_page()
             status_label.config(text="Status: [Fase 2] Acessando Regras de Exibição...", fg="orange")
             
-            # URL Corrigida conforme sua instrução
             page.goto(f"{BASE_URL}/CustomFieldRule", timeout=60000)
-            page.wait_for_load_state("networkidle")
             
-            if "login" in page.url.lower():
-                raise Exception("Sessão expirada ou Cookie inválido.")
-
-            time.sleep(3)
+            try:
+                page.locator("table tbody tr").first.wait_for(state="visible", timeout=30000)
+            except:
+                raise Exception("A listagem de regras não carregou corretamente.")
             
-            regras_linhas = page.locator("table tbody tr, tr").all()
+            regras_linhas = page.locator("table tbody tr").all()
             total_regras = len(regras_linhas)
             
             status_label.config(text=f"Status: [Fase 2] Analisando {total_regras} regras...", fg="orange")
             
             for index in range(total_regras):
                 try:
-                    linhas_atuais = page.locator("table tbody tr, tr").all()
+                    linhas_atuais = page.locator("table tbody tr").all()
                     if index >= len(linhas_atuais):
                         break
                         
@@ -294,7 +215,7 @@ def executar_fase2(cookie_val, status_label):
                 except Exception as ex_item:
                     try:
                         page.goto(f"{BASE_URL}/CustomFieldRule", timeout=30000)
-                        page.wait_for_load_state("networkidle")
+                        page.locator("table tbody tr").first.wait_for(state="visible", timeout=30000)
                     except Exception:
                         pass
                     continue
