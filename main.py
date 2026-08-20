@@ -19,12 +19,13 @@ def executar_fase1(cookie_val, status_label):
     
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(channel="chrome", headless=True, args=["--start-maximized"])
+            # Mantemos visível para você acompanhar e poder intervir se necessário
+            browser = p.chromium.launch(channel="chrome", headless=False, args=["--start-maximized"])
             context = browser.new_context(viewport={"width": 1920, "height": 1080})
             
+            # Injeção exata do cookie utilizando a URL para evitar erros de domínio (.omne vs omne)
             context.add_cookies([
-                {"name": ".ASPXAUTH", "value": cookie_val.strip(), "domain": "omne.movidesk.com", "path": "/"},
-                {"name": ".ASPXAUTH", "value": cookie_val.strip(), "domain": ".movidesk.com", "path": "/"}
+                {"name": ".ASPXAUTH", "value": cookie_val.strip(), "url": BASE_URL}
             ])
             
             page = context.new_page()
@@ -32,15 +33,24 @@ def executar_fase1(cookie_val, status_label):
             status_label.config(text="Status: [Fase 1] Acessando tela de Campos...", fg="orange")
             page.goto(f"{BASE_URL}/CustomField", timeout=60000)
             
-            # 1. Espera cirúrgica baseada na sua imagem ("Exibindo de 1 até...")
-            status_label.config(text="Status: [Fase 1] Aguardando a tabela aparecer...", fg="orange")
-            try:
-                # O robô agora espera ESSE texto aparecer para ter certeza que carregou
-                page.locator("text=total de").wait_for(state="visible", timeout=30000)
-            except Exception:
-                raise Exception("A página carregou, mas a lista de campos não apareceu. Verifique o cookie.")
+            # BLINDAGEM: Se o cookie falhar ou pedir validação, ele pausa e deixa você logar manualmente na tela!
+            if "login" in page.url.lower() or "account" in page.url.lower():
+                status_label.config(text="Status: Faça o login na janela do Chrome...", fg="red")
+                # O robô aguarda até 2 minutos para você digitar a senha e entrar na tela correta
+                page.wait_for_url("**/CustomField**", timeout=120000)
+                status_label.config(text="Status: Login detectado! Retomando automação...", fg="orange")
 
-            # 2. Descobre o total de registros lendo o texto do cabeçalho
+            status_label.config(text="Status: [Fase 1] Aguardando a tabela carregar...", fg="orange")
+            
+            # Espera a tabela ou o texto de totalização aparecer (com fallback resiliente)
+            try:
+                page.locator("text=total de").first.wait_for(state="visible", timeout=15000)
+            except Exception:
+                try:
+                    page.locator("table tbody tr").first.wait_for(state="visible", timeout=15000)
+                except Exception:
+                    raise Exception("A página de Campos carregou, mas a tabela de dados está vazia ou bloqueada.")
+
             total_registros = 1292
             try:
                 texto_paginacao = page.locator("text=total de").first.inner_text()
@@ -52,12 +62,10 @@ def executar_fase1(cookie_val, status_label):
 
             status_label.config(text=f"Status: [Fase 1] Rolando {total_registros} campos internamente...", fg="orange")
 
-            # 3. Lógica de scroll INTERNO da tabela (foca no contêiner com a barra)
             ultimo_count = 0
             tentativas_paradas = 0
 
             for _ in range(100):
-                # O comando JS agora mira explicitamente em áreas roláveis internas, como o k-grid-content do Movidesk
                 page.evaluate("""() => {
                     let grid = document.querySelector('.k-grid-content') || 
                                document.querySelector('.table-responsive') || 
@@ -75,7 +83,7 @@ def executar_fase1(cookie_val, status_label):
                     
                 if linhas_atuais == ultimo_count:
                     tentativas_paradas += 1
-                    if tentativas_paradas >= 6: # Se a tabela parar de crescer, encerra o loop
+                    if tentativas_paradas >= 6: 
                         break
                 else:
                     tentativas_paradas = 0
@@ -83,20 +91,17 @@ def executar_fase1(cookie_val, status_label):
 
             status_label.config(text="Status: [Fase 1] Extraindo colunas...", fg="orange")
 
-            # 4. Extração exata baseada na estrutura da sua imagem
             dados_campos = []
             linhas = page.locator("table tbody tr").all()
 
             for linha in linhas:
                 colunas = linha.locator("td").all()
                 
-                # A imagem mostra que existem várias colunas. Precisamos de pelo menos 4 (Check, ID, Nome, Tipo)
                 if len(colunas) >= 4:
                     c_id = colunas[1].inner_text().strip()
                     c_nome = colunas[2].inner_text().strip()
                     c_tipo = colunas[3].inner_text().strip()
 
-                    # Só salva se a coluna de ID realmente for um número (evita cabeçalhos perdidos)
                     if c_id.isdigit():
                         dados_campos.append({
                             "Id": c_id,
@@ -108,7 +113,7 @@ def executar_fase1(cookie_val, status_label):
             browser.close()
 
             if not dados_campos:
-                raise Exception("Nenhum dado capturado. A tabela foi encontrada, mas não foi possível ler as colunas de ID e Nome.")
+                raise Exception("Nenhum dado capturado. A tabela estava na tela, mas o robô não conseguiu ler as células.")
 
             df = pd.DataFrame(dados_campos).drop_duplicates(subset=["Id"])
             df.to_excel(EXCEL_FILE, index=False)
@@ -139,12 +144,11 @@ def executar_fase2(cookie_val, status_label):
         df["Regra de exibição"] = df["Regra de exibição"].fillna("").astype(str)
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(channel="chrome", headless=True, args=["--start-maximized"])
+            browser = p.chromium.launch(channel="chrome", headless=False, args=["--start-maximized"])
             context = browser.new_context(viewport={"width": 1920, "height": 1080})
             
             context.add_cookies([
-                {"name": ".ASPXAUTH", "value": cookie_val.strip(), "domain": "omne.movidesk.com", "path": "/"},
-                {"name": ".ASPXAUTH", "value": cookie_val.strip(), "domain": ".movidesk.com", "path": "/"}
+                {"name": ".ASPXAUTH", "value": cookie_val.strip(), "url": BASE_URL}
             ])
             
             page = context.new_page()
@@ -152,8 +156,14 @@ def executar_fase2(cookie_val, status_label):
             
             page.goto(f"{BASE_URL}/CustomFieldRule", timeout=60000)
             
+            # Mesma blindagem para a Fase 2: se precisar logar, ele aguarda.
+            if "login" in page.url.lower() or "account" in page.url.lower():
+                status_label.config(text="Status: Faça o login na janela do Chrome...", fg="red")
+                page.wait_for_url("**/CustomFieldRule**", timeout=120000)
+                status_label.config(text="Status: Login detectado! Retomando automação...", fg="orange")
+            
             try:
-                page.locator("table tbody tr").first.wait_for(state="visible", timeout=30000)
+                page.locator("table tbody tr").first.wait_for(state="visible", timeout=20000)
             except:
                 raise Exception("A listagem de regras não carregou corretamente.")
             
@@ -215,7 +225,7 @@ def executar_fase2(cookie_val, status_label):
                 except Exception as ex_item:
                     try:
                         page.goto(f"{BASE_URL}/CustomFieldRule", timeout=30000)
-                        page.locator("table tbody tr").first.wait_for(state="visible", timeout=30000)
+                        page.locator("table tbody tr").first.wait_for(state="visible", timeout=20000)
                     except Exception:
                         pass
                     continue
