@@ -62,7 +62,9 @@ def executar_fase1(cookie_val, status_label):
             page.on("response", interceptar_resposta)
 
             status_label.config(text="Status: [Fase 1] Acessando tela de Campos...", fg="orange")
-            page.goto(f"{BASE_URL}/Settings/CustomFields", timeout=60000)
+            
+            # URL Corrigida conforme sua instrução
+            page.goto(f"{BASE_URL}/CustomField", timeout=60000)
             page.wait_for_load_state("networkidle")
             
             if "login" in page.url.lower():
@@ -156,7 +158,6 @@ def executar_fase1(cookie_val, status_label):
                 c_nome = ""
                 c_tipo = "Personalizado"
 
-                # Remove o ID da lista de textos úteis para isolar Nome e Tipo
                 textos_sem_id = [t for t in textos_uteis if t != c_id]
                 
                 if len(textos_sem_id) >= 1:
@@ -196,6 +197,7 @@ def executar_fase1(cookie_val, status_label):
         status_label.config(text="Status: Erro na Fase 1.", fg="red")
         messagebox.showerror("Erro", f"Ocorreu um erro na Fase 1:\n{str(e)}")
 
+
 def executar_fase2(cookie_val, status_label):
     if not cookie_val:
         messagebox.showwarning("Aviso", "Por favor, insira o Cookie .ASPXAUTH do Movidesk!")
@@ -225,7 +227,8 @@ def executar_fase2(cookie_val, status_label):
             page = context.new_page()
             status_label.config(text="Status: [Fase 2] Acessando Regras de Exibição...", fg="orange")
             
-            page.goto(f"{BASE_URL}/Settings/TicketRule", timeout=60000)
+            # URL Corrigida conforme sua instrução
+            page.goto(f"{BASE_URL}/CustomFieldRule", timeout=60000)
             page.wait_for_load_state("networkidle")
             
             if "login" in page.url.lower():
@@ -233,7 +236,6 @@ def executar_fase2(cookie_val, status_label):
 
             time.sleep(3)
             
-            # Localiza todas as linhas de regras
             regras_linhas = page.locator("table tbody tr, tr").all()
             total_regras = len(regras_linhas)
             
@@ -261,7 +263,6 @@ def executar_fase2(cookie_val, status_label):
                     page.wait_for_load_state("networkidle")
                     time.sleep(1.5)
                     
-                    # Clica na aba 'Campos'
                     aba_campos = page.locator("text=Campos, a:has-text('Campos')").first
                     if aba_campos.count() > 0:
                         aba_campos.click()
@@ -269,7 +270,6 @@ def executar_fase2(cookie_val, status_label):
                         
                         conteudo_tela = page.inner_text("body")
                         
-                        # Cruza com os campos da planilha
                         for idx_df, row in df.iterrows():
                             nome_campo = str(row["Nome"]).strip()
                             if nome_campo and nome_campo in conteudo_tela:
@@ -282,19 +282,18 @@ def executar_fase2(cookie_val, status_label):
                                     if nome_regra not in lista_regras:
                                         df.at[idx_df, "Regra de exibição"] = valor_atual + "\n" + nome_regra
 
-                    # Retorna à listagem principal
                     botao_cancelar = page.locator("text=CANCELAR, button:has-text('Cancelar'), a:has-text('Cancelar')").first
                     if botao_cancelar.count() > 0:
                         botao_cancelar.click()
                     else:
-                        page.goto(f"{BASE_URL}/Settings/TicketRule", timeout=30000)
+                        page.goto(f"{BASE_URL}/CustomFieldRule", timeout=30000)
                         
                     page.wait_for_load_state("networkidle")
                     time.sleep(1.2)
                     
                 except Exception as ex_item:
                     try:
-                        page.goto(f"{BASE_URL}/Settings/TicketRule", timeout=30000)
+                        page.goto(f"{BASE_URL}/CustomFieldRule", timeout=30000)
                         page.wait_for_load_state("networkidle")
                     except Exception:
                         pass
