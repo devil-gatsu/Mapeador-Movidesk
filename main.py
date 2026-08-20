@@ -1,135 +1,150 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import threading
-import queue
-import time
 import pandas as pd
+import os
 from playwright.sync_api import sync_playwright
 
-# Fila para comunicação entre a interface e o navegador
-cmd_queue = queue.Queue()
 global_df = None
 global_filepath = ""
 
-def playwright_worker(status_label):
-    global global_df, global_filepath
-    
-    with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=False, args=["--start-maximized"])
-        context = browser.new_context(viewport={"width": 1920, "height": 1080})
-        page = context.new_page()
-        
-        # Vai direto para a tela de regras
-        page.goto("https://omne.movidesk.com/CustomFieldRule")
-        
-        status_label.config(text="Status: Navegador aberto! Logue e abra uma Regra.", fg="green")
-        
-        # Fica escutando os cliques do seu botão "Capturar"
-        while True:
-            try:
-                cmd = cmd_queue.get(timeout=1)
-                
-                if cmd == "CAPTURAR":
-                    status_label.config(text="Status: Lendo a tela e salvando...", fg="orange")
-                    
-                    # 1. Pega o nome da regra (Tenta pegar do input de texto superior do Movidesk)
-                    try:
-                        nome_regra = page.evaluate("document.querySelector('input[type=\"text\"]').value")
-                    except:
-                        nome_regra = ""
-                        
-                    if not nome_regra or nome_regra.strip() == "":
-                        nome_regra = "Regra_Desconhecida"
-                        
-                    # 2. Pega todo o texto visível na página atual
-                    conteudo_tela = page.inner_text("body")
-                    
-                    # 3. Prepara as colunas da planilha (Índice 1 = Coluna B | Índice 3 = Coluna D)
-                    coluna_nome = global_df.columns[1] 
-                    coluna_alvo = global_df.columns[3] 
-                    
-                    global_df[coluna_alvo] = global_df[coluna_alvo].fillna("").astype(str)
-                    campos_encontrados = 0
-                    
-                    # 4. Cruza a planilha com a tela
-                    for idx, row in global_df.iterrows():
-                        nome_campo = str(row[coluna_nome]).strip()
-                        
-                        # Se o nome do campo da planilha estiver visível na tela da regra
-                        if nome_campo and nome_campo in conteudo_tela:
-                            valor_atual = str(global_df.at[idx, coluna_alvo]).strip()
-                            
-                            # Escreve a regra nova
-                            if not valor_atual or valor_atual.lower() == "nan":
-                                global_df.at[idx, coluna_alvo] = nome_regra
-                            else:
-                                # Adiciona quebra de linha se o campo estiver em mais de uma regra
-                                lista_regras = [r.strip() for r in valor_atual.split("\n")]
-                                if nome_regra not in lista_regras:
-                                    global_df.at[idx, coluna_alvo] = valor_atual + "\n" + nome_regra
-                            
-                            campos_encontrados += 1
-                                    
-                    # 5. Salva o Excel imediatamente
-                    global_df.to_excel(global_filepath, index=False)
-                    status_label.config(text=f"Status: '{nome_regra[:15]}...' salva! ({campos_encontrados} campos)", fg="green")
-                    
-            except queue.Empty:
-                # Se o usuário fechar o Chrome manualmente, encerra a automação
-                if page.is_closed():
-                    status_label.config(text="Status: Navegador foi fechado.", fg="red")
-                    break
-
-def iniciar_navegador(status_label):
+def selecionar_planilha(status_label):
     global global_df, global_filepath
     
     filepath = filedialog.askopenfilename(
-        title="Selecione a planilha de campos exportada",
+        title="Selecione a planilha de campos",
         filetypes=[("Arquivos Excel", "*.xlsx *.xls")]
     )
     if not filepath:
         return
         
-    global_filepath = filepath
     try:
+        global_filepath = filepath
         global_df = pd.read_excel(filepath)
-        # Garante que existam no mínimo as colunas A, B, C e D
+        
         while len(global_df.columns) < 4:
-            global_df[f"Coluna_{len(global_df.columns)}"] = ""
+            global_df[f"Coluna_Vazia_{len(global_df.columns)}"] = ""
             
+        status_label.config(text=f"Status: Planilha carregada! ({len(global_df)} linhas)", fg="green")
     except Exception as e:
+        status_label.config(text="Status: Erro ao ler planilha.", fg="red")
         messagebox.showerror("Erro", f"Erro ao ler a planilha:\n{str(e)}")
+
+def executar_captura(status_label):
+    global global_df, global_filepath
+    
+    if global_df is None:
+        messagebox.showwarning("Aviso", "Selecione a planilha primeiro!")
         return
         
-    status_label.config(text="Status: Iniciando Chrome...", fg="orange")
+    status_label.config(text="Status: Conectando ao seu Chrome...", fg="orange")
     
-    # Inicia a thread do Playwright
-    threading.Thread(target=playwright_worker, args=(status_label,), daemon=True).start()
+    try:
+        with sync_playwright() as p:
+            # Conecta direto no Chrome que já está aberto na sua máquina
+            try:
+                browser = p.chromium.connect_over_cdp("http://localhost:9222")
+            except Exception:
+                raise Exception("Não consegui conectar ao seu Chrome. Você abriu com a porta 9222?")
+            
+            context = browser.contexts[0]
+            
+            # Procura a aba do Movidesk entre as abas que você tem abertas
+            page = None
+            for p_tab in context.pages:
+                if "movidesk.com" in p_tab.url:
+                    page = p_tab
+                    break
+                    
+            if not page:
+                raise Exception("Não encontrei nenhuma aba do Movidesk aberta no seu Chrome!")
 
-def capturar_tela(status_label):
-    # Envia o comando para a fila do Playwright trabalhar
-    if global_df is not None:
-        cmd_queue.put("CAPTURAR")
-    else:
-        messagebox.showwarning("Aviso", "Inicie o navegador e selecione a planilha primeiro!")
+            status_label.config(text="Status: Lendo a tela...", fg="orange")
+
+            # 1. Tenta pegar o nome da regra inteligentemente (ignora barras de pesquisa)
+            nome_regra = page.evaluate("""() => {
+                let inputs = Array.from(document.querySelectorAll('input[type="text"]'));
+                let validInputs = inputs.filter(i => 
+                    i.value.trim() !== '' && 
+                    !i.placeholder.toLowerCase().includes('pesquisar') &&
+                    !i.className.toLowerCase().includes('search')
+                );
+                if (validInputs.length > 0) return validInputs[0].value.trim();
+                
+                let title = document.querySelector('.k-window-title, h1, h2');
+                if (title) return title.innerText.trim();
+                
+                return "Regra_Desconhecida";
+            }""")
+            
+            if not nome_regra or nome_regra == "":
+                nome_regra = "Regra_Desconhecida"
+
+            # 2. Puxa todo o texto da tela e fatia linha por linha
+            textos_brutos = page.locator("body").inner_text().split('\n')
+            textos_tela = [t.strip() for t in textos_brutos if t.strip() != ""]
+
+            # 3. Prepara as colunas
+            coluna_nome = global_df.columns[1] # Coluna B
+            coluna_alvo = global_df.columns[3] # Coluna D
+            global_df[coluna_alvo] = global_df[coluna_alvo].fillna("").astype(str)
+            
+            campos_encontrados = 0
+
+            # 4. Cruzamento exato de dados (Adeus 997 campos falsos)
+            for idx, row in global_df.iterrows():
+                nome_campo_planilha = str(row[coluna_nome]).strip()
+                
+                if not nome_campo_planilha or nome_campo_planilha.lower() == "nan":
+                    continue
+                
+                # A regra agora é: A linha da tela tem que ser EXATAMENTE igual ao nome do campo,
+                # ou pelo menos COMEÇAR exatamente com o nome do campo (para lidar com campos como "(Infra/TI) Selecione o agente:")
+                match_encontrado = False
+                for texto_na_tela in textos_tela:
+                    if texto_na_tela == nome_campo_planilha or texto_na_tela.startswith(nome_campo_planilha):
+                        match_encontrado = True
+                        break
+                        
+                if match_encontrado:
+                    valor_atual = str(global_df.at[idx, coluna_alvo]).strip()
+                    
+                    if not valor_atual or valor_atual.lower() == "nan":
+                        global_df.at[idx, coluna_alvo] = nome_regra
+                    else:
+                        lista_regras = [r.strip() for r in valor_atual.split("\n")]
+                        if nome_regra not in lista_regras:
+                            global_df.at[idx, coluna_alvo] = valor_atual + "\n" + nome_regra
+                            
+                    campos_encontrados += 1
+                            
+            # 5. Salva na hora
+            global_df.to_excel(global_filepath, index=False)
+            status_label.config(text=f"Status: '{nome_regra[:15]}...' salva! ({campos_encontrados} campos)", fg="green")
+
+    except Exception as e:
+        status_label.config(text="Status: Erro ao capturar.", fg="red")
+        messagebox.showerror("Erro", str(e))
+
+def btn_capturar_thread(status_label):
+    threading.Thread(target=executar_captura, args=(status_label,)).start()
 
 def criar_interface():
     root = tk.Tk()
     root.title("Assistente Movidesk")
-    root.geometry("350x220")
-    root.attributes("-topmost", True) # Fica sempre no topo para facilitar o clique
+    root.geometry("350x180")
+    root.attributes("-topmost", True)
     root.resizable(False, False)
 
-    tk.Label(root, text="Mapeador Semiautomático", font=("Arial", 11, "bold")).pack(pady=10)
+    tk.Label(root, text="Mapeador Semiautomático - CDP", font=("Arial", 11, "bold")).pack(pady=10)
 
-    status_label = tk.Label(root, text="Status: Aguardando...", fg="blue", font=("Arial", 9))
+    status_label = tk.Label(root, text="Status: Aguardando planilha...", fg="blue", font=("Arial", 9))
     status_label.pack(pady=5)
 
-    btn_iniciar = tk.Button(root, text="1. Iniciar Chrome e Abrir Planilha", command=lambda: iniciar_navegador(status_label), width=35, bg="#e1f5fe")
-    btn_iniciar.pack(pady=5)
+    btn_planilha = tk.Button(root, text="1. Selecionar Planilha", command=lambda: selecionar_planilha(status_label), width=35, bg="#e1f5fe")
+    btn_planilha.pack(pady=5)
 
-    # Botão de destaque para a ação repetitiva
-    btn_capturar = tk.Button(root, text="2. CAPTURAR REGRA ATUAL", command=lambda: capturar_tela(status_label), width=35, height=2, bg="#c8e6c9", font=("Arial", 9, "bold"))
+    btn_capturar = tk.Button(root, text="2. CAPTURAR REGRA ATUAL", command=lambda: btn_capturar_thread(status_label), width=35, height=2, bg="#c8e6c9", font=("Arial", 9, "bold"))
     btn_capturar.pack(pady=5)
 
     root.mainloop()
