@@ -3,6 +3,7 @@ from tkinter import messagebox
 import threading
 import time
 import os
+import re
 import pandas as pd
 from playwright.sync_api import sync_playwright
 
@@ -41,40 +42,40 @@ def executar_fase1(cookie_val, status_label):
             if "login" in page.url.lower():
                 raise Exception("Sessão expirada ou Cookie inválido. O Movidesk redirecionou para o login.")
 
-            status_label.config(text="Status: [Fase 1] Aguardando carregamento da tabela...", fg="orange")
+            status_label.config(text="Status: [Fase 1] Aguardando tabela carregar...", fg="orange")
             
-            # Aguarda explicitamente o elemento da tabela ou o container de dados aparecer na tela
+            # Espera a página processar e desenhar as linhas (tr)
             try:
-                page.wait_for_selector("table, .grid, tbody tr", timeout=15000)
+                page.wait_for_selector("tr", timeout=15000)
             except:
                 pass
-                
-            time.sleep(4) # Tempo de respiro para renderização dos dados via JS do Movidesk
+            time.sleep(3)
 
             status_label.config(text="Status: [Fase 1] Lendo total de campos...", fg="orange")
-            total_registros = 0
+            total_registros = 1292 # Fallback padrão
             try:
-                texto_info = page.locator("text=total de").locator("xpath=..").inner_text()
-                import re
-                numeros = re.findall(r'\d+', texto_info)
-                if len(numeros) >= 2:
-                    total_registros = int(numeros[-1])
+                texto_pagina = page.locator("body").inner_text()
+                match = re.search(r'total de (\d+)', texto_pagina, re.IGNORECASE)
+                if match:
+                    total_registros = int(match.group(1))
             except:
-                total_registros = 1292
+                pass
 
-            status_label.config(text=f"Status: [Fase 1] Executando scroll para carregar {total_registros} campos...", fg="orange")
+            status_label.config(text=f"Status: [Fase 1] Executando scroll para {total_registros} campos...", fg="orange")
             
             ultimo_tamanho = 0
             tentativas_sem_mudanca = 0
             
+            # Loop de Scroll Infinito
             while True:
+                # Pressiona END para rolar mais rápido, além do script JS
+                page.keyboard.press("End")
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(2)
                 
-                linhas = page.locator("table tbody tr, .grid-row, tr")
-                tamanho_atual = linhas.count()
+                tamanho_atual = page.locator("tr").count()
                 
-                if (total_registros > 0 and tamanho_atual >= total_registros) or tentativas_sem_mudanca > 12:
+                if (total_registros > 0 and tamanho_atual >= total_registros) or tentativas_sem_mudanca > 10:
                     break
                     
                 if tamanho_atual == ultimo_tamanho:
@@ -83,40 +84,43 @@ def executar_fase1(cookie_val, status_label):
                     tentativas_sem_mudanca = 0
                     ultimo_tamanho = tamanho_atual
 
-            status_label.config(text="Status: [Fase 1] Extraindo dados dos campos...", fg="orange")
+            status_label.config(text="Status: [Fase 1] Extraindo dados (Scanner Inteligente)...", fg="orange")
             
             dados_campos = []
-            linhas = page.locator("table tbody tr")
-            count = linhas.count()
+            todas_linhas = page.locator("tr").all()
             
-            # Caso a tabela use outra estrutura, faz um fallback de varredura
-            if count == 0:
-                linhas = page.locator("tr")
-                count = linhas.count()
-
-            for i in range(count):
-                linha = linhas.nth(i)
-                colunas = linha.locator("td")
-                if colunas.count() >= 3:
-                    id_campo = colunas.nth(0).inner_text().strip()
-                    nome_campo = colunas.nth(1).inner_text().strip()
-                    tipo_campo = colunas.nth(2).inner_text().strip()
-                    
-                    if id_campo.isdigit():
-                        dados_campos.append({
-                            "Id": id_campo,
-                            "Nome": nome_campo,
-                            "Tipo": tipo_campo,
-                            "Regra de exibição": ""
-                        })
+            # Varredura inteligente ignorando colunas vazias
+            for linha in todas_linhas:
+                # Puxa todos os textos das células da linha
+                textos_celulas = linha.locator("td").all_inner_texts()
+                
+                # Limpa os espaços em branco e remove colunas vazias (ex: checkboxes)
+                textos_limpos = [texto.strip() for texto in textos_celulas if texto.strip() != ""]
+                
+                id_index = -1
+                # Encontra a primeira coluna que contém APENAS números (o ID do campo)
+                for idx, txt in enumerate(textos_limpos):
+                    if txt.isdigit():
+                        id_index = idx
+                        break
+                
+                # Se encontrou um ID numérico e existem pelo menos mais duas colunas depois dele (Nome e Tipo)
+                if id_index != -1 and len(textos_limpos) >= id_index + 3:
+                    dados_campos.append({
+                        "Id": textos_limpos[id_index],
+                        "Nome": textos_limpos[id_index + 1],
+                        "Tipo": textos_limpos[id_index + 2],
+                        "Regra de exibição": ""
+                    })
 
             browser.close()
             
-            df = pd.DataFrame(dados_campos)
+            # Remove possíveis duplicidades caso a tabela tenha cabeçalhos flutuantes repetidos
+            df = pd.DataFrame(dados_campos).drop_duplicates(subset=["Id"])
             df.to_excel(EXCEL_FILE, index=False)
             
-            status_label.config(text=f"Status: [Fase 1] Concluído! {len(dados_campos)} campos salvos.", fg="green")
-            messagebox.showinfo("Sucesso", f"Fase 1 finalizada! {len(dados_campos)} registros salvos em {EXCEL_FILE}.")
+            status_label.config(text=f"Status: [Fase 1] Concluído! {len(df)} campos salvos.", fg="green")
+            messagebox.showinfo("Sucesso", f"Fase 1 finalizada! {len(df)} registros salvos em {EXCEL_FILE}.")
             
     except Exception as e:
         status_label.config(text="Status: Erro na Fase 1.", fg="red")
@@ -189,31 +193,32 @@ def executar_fase2(cookie_val, status_label):
                     time.sleep(1.5)
                     
                     aba_campos = page.locator("text=Campos").first
-                    aba_campos.click()
-                    time.sleep(1)
-                    
-                    campos_encontrados_nesta_regra = []
-                    pagina_texto_completo = page.inner_text("body")
-                    
-                    for idx, row in df.iterrows():
-                        nome_f = str(row["Nome"]).strip()
-                        if nome_f and nome_f in pagina_texto_completo:
-                            campos_encontrados_nesta_regra.append(nome_f)
+                    if aba_campos.count() > 0:
+                        aba_campos.click()
+                        time.sleep(1)
+                        
+                        campos_encontrados_nesta_regra = []
+                        pagina_texto_completo = page.inner_text("body")
+                        
+                        for idx, row in df.iterrows():
+                            nome_f = str(row["Nome"]).strip()
+                            if nome_f and nome_f in pagina_texto_completo:
+                                campos_encontrados_nesta_regra.append(nome_f)
 
-                    for nome_campo_encontrado in campos_encontrados_nesta_regra:
-                        mask = df["Nome"] == nome_campo_encontrado
-                        if mask.any():
-                            valor_atual = str(df.loc[mask, "Regra de exibição"].values[0]).strip()
-                            
-                            if not valor_atual or valor_atual == "nan":
-                                novo_valor = nome_regra
-                            else:
-                                if nome_regra not in valor_atual.split("\n"):
-                                    novo_valor = valor_atual + "\n" + nome_regra
+                        for nome_campo_encontrado in campos_encontrados_nesta_regra:
+                            mask = df["Nome"] == nome_campo_encontrado
+                            if mask.any():
+                                valor_atual = str(df.loc[mask, "Regra de exibição"].values[0]).strip()
+                                
+                                if not valor_atual or valor_atual == "nan":
+                                    novo_valor = nome_regra
                                 else:
-                                    novo_valor = valor_atual
-                                    
-                            df.loc[mask, "Regra de exibição"] = novo_valor
+                                    if nome_regra not in valor_atual.split("\n"):
+                                        novo_valor = valor_atual + "\n" + nome_regra
+                                    else:
+                                        novo_valor = valor_atual
+                                        
+                                df.loc[mask, "Regra de exibição"] = novo_valor
 
                     botao_cancelar = page.locator("text=CANCELAR").first
                     if botao_cancelar.count() > 0:
