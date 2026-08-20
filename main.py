@@ -22,11 +22,9 @@ def executar_fase1(cookie_val, status_label):
         base_url = obter_url_base(cookie_val)
         
         with sync_playwright() as p:
-            # Utiliza o Google Chrome instalado no sistema local, evitando erros de driver
             browser = p.chromium.launch(channel="chrome", headless=True, args=["--start-maximized"])
             context = browser.new_context(viewport={"width": 1920, "height": 1080})
             
-            # Injeta o cookie de sessão exato fornecido pelo usuário
             context.add_cookies([{
                 "name": ".ASPXAUTH",
                 "value": cookie_val.strip(),
@@ -37,16 +35,23 @@ def executar_fase1(cookie_val, status_label):
             page = context.new_page()
             status_label.config(text="Status: [Fase 1] Acessando tela de Campos Adicionais...", fg="orange")
             
-            # Navega direto para a tela de Campos Adicionais do Movidesk
             page.goto(f"{base_url}/Settings/CustomFields", timeout=60000)
             page.wait_for_load_state("networkidle")
             
             if "login" in page.url.lower():
                 raise Exception("Sessão expirada ou Cookie inválido. O Movidesk redirecionou para o login.")
 
-            status_label.config(text="Status: [Fase 1] Lendo total de campos...", fg="orange")
-            time.sleep(3)
+            status_label.config(text="Status: [Fase 1] Aguardando carregamento da tabela...", fg="orange")
             
+            # Aguarda explicitamente o elemento da tabela ou o container de dados aparecer na tela
+            try:
+                page.wait_for_selector("table, .grid, tbody tr", timeout=15000)
+            except:
+                pass
+                
+            time.sleep(4) # Tempo de respiro para renderização dos dados via JS do Movidesk
+
+            status_label.config(text="Status: [Fase 1] Lendo total de campos...", fg="orange")
             total_registros = 0
             try:
                 texto_info = page.locator("text=total de").locator("xpath=..").inner_text()
@@ -64,12 +69,12 @@ def executar_fase1(cookie_val, status_label):
             
             while True:
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(1.5)
+                time.sleep(2)
                 
-                linhas = page.locator("table tbody tr")
+                linhas = page.locator("table tbody tr, .grid-row, tr")
                 tamanho_atual = linhas.count()
                 
-                if tamanho_atual >= total_registros or tentativas_sem_mudanca > 10:
+                if (total_registros > 0 and tamanho_atual >= total_registros) or tentativas_sem_mudanca > 12:
                     break
                     
                 if tamanho_atual == ultimo_tamanho:
@@ -84,6 +89,11 @@ def executar_fase1(cookie_val, status_label):
             linhas = page.locator("table tbody tr")
             count = linhas.count()
             
+            # Caso a tabela use outra estrutura, faz um fallback de varredura
+            if count == 0:
+                linhas = page.locator("tr")
+                count = linhas.count()
+
             for i in range(count):
                 linha = linhas.nth(i)
                 colunas = linha.locator("td")
