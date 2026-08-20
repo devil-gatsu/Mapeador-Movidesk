@@ -3,10 +3,28 @@ from tkinter import filedialog, messagebox
 import threading
 import pandas as pd
 import os
+import time
 from playwright.sync_api import sync_playwright
 
 global_df = None
 global_filepath = ""
+
+def preparar_chrome(status_label):
+    resposta = messagebox.askyesno(
+        "Preparar Navegador", 
+        "Isso vai forçar o encerramento de todos os processos invisíveis do Chrome e abri-lo corretamente para o robô.\n\nSalve o que estiver fazendo no navegador. Deseja continuar?"
+    )
+    if resposta:
+        status_label.config(text="Status: Reiniciando Chrome...", fg="orange")
+        try:
+            # Mata o Chrome de verdade (processos fantasmas)
+            os.system("taskkill /F /IM chrome.exe /T")
+            time.sleep(1.5)
+            # Abre o Chrome já com a porta certa
+            os.system("start chrome.exe --remote-debugging-port=9222")
+            status_label.config(text="Status: Chrome pronto! Pode logar no Movidesk.", fg="green")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Não consegui abrir o Chrome: {e}")
 
 def selecionar_planilha(status_label):
     global global_df, global_filepath
@@ -41,15 +59,17 @@ def executar_captura(status_label):
     
     try:
         with sync_playwright() as p:
-            # Conecta direto no Chrome que já está aberto na sua máquina
+            # Tenta conectar pelo IP explícito para evitar bugs do localhost no Windows
             try:
-                browser = p.chromium.connect_over_cdp("http://localhost:9222")
-            except Exception:
-                raise Exception("Não consegui conectar ao seu Chrome. Você abriu com a porta 9222?")
+                browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+            except Exception as e1:
+                try:
+                    browser = p.chromium.connect_over_cdp("http://localhost:9222")
+                except Exception as e2:
+                    raise Exception(f"Erro de Conexão. O Chrome não abriu a porta 9222.\n\nPor favor, clique no Botão 1 para o sistema forçar a abertura correta.\n\nDetalhe do erro: {str(e1)}")
             
             context = browser.contexts[0]
             
-            # Procura a aba do Movidesk entre as abas que você tem abertas
             page = None
             for p_tab in context.pages:
                 if "movidesk.com" in p_tab.url:
@@ -57,11 +77,10 @@ def executar_captura(status_label):
                     break
                     
             if not page:
-                raise Exception("Não encontrei nenhuma aba do Movidesk aberta no seu Chrome!")
+                raise Exception("A conexão deu certo, mas não encontrei a aba do Movidesk aberta!")
 
             status_label.config(text="Status: Lendo a tela...", fg="orange")
 
-            # 1. Tenta pegar o nome da regra inteligentemente (ignora barras de pesquisa)
             nome_regra = page.evaluate("""() => {
                 let inputs = Array.from(document.querySelectorAll('input[type="text"]'));
                 let validInputs = inputs.filter(i => 
@@ -80,26 +99,21 @@ def executar_captura(status_label):
             if not nome_regra or nome_regra == "":
                 nome_regra = "Regra_Desconhecida"
 
-            # 2. Puxa todo o texto da tela e fatia linha por linha
             textos_brutos = page.locator("body").inner_text().split('\n')
             textos_tela = [t.strip() for t in textos_brutos if t.strip() != ""]
 
-            # 3. Prepara as colunas
-            coluna_nome = global_df.columns[1] # Coluna B
-            coluna_alvo = global_df.columns[3] # Coluna D
+            coluna_nome = global_df.columns[1] 
+            coluna_alvo = global_df.columns[3] 
             global_df[coluna_alvo] = global_df[coluna_alvo].fillna("").astype(str)
             
             campos_encontrados = 0
 
-            # 4. Cruzamento exato de dados (Adeus 997 campos falsos)
             for idx, row in global_df.iterrows():
                 nome_campo_planilha = str(row[coluna_nome]).strip()
                 
                 if not nome_campo_planilha or nome_campo_planilha.lower() == "nan":
                     continue
                 
-                # A regra agora é: A linha da tela tem que ser EXATAMENTE igual ao nome do campo,
-                # ou pelo menos COMEÇAR exatamente com o nome do campo (para lidar com campos como "(Infra/TI) Selecione o agente:")
                 match_encontrado = False
                 for texto_na_tela in textos_tela:
                     if texto_na_tela == nome_campo_planilha or texto_na_tela.startswith(nome_campo_planilha):
@@ -118,7 +132,6 @@ def executar_captura(status_label):
                             
                     campos_encontrados += 1
                             
-            # 5. Salva na hora
             global_df.to_excel(global_filepath, index=False)
             status_label.config(text=f"Status: '{nome_regra[:15]}...' salva! ({campos_encontrados} campos)", fg="green")
 
@@ -132,19 +145,22 @@ def btn_capturar_thread(status_label):
 def criar_interface():
     root = tk.Tk()
     root.title("Assistente Movidesk")
-    root.geometry("350x180")
+    root.geometry("350x230")
     root.attributes("-topmost", True)
     root.resizable(False, False)
 
     tk.Label(root, text="Mapeador Semiautomático - CDP", font=("Arial", 11, "bold")).pack(pady=10)
 
-    status_label = tk.Label(root, text="Status: Aguardando planilha...", fg="blue", font=("Arial", 9))
+    status_label = tk.Label(root, text="Status: Aguardando...", fg="blue", font=("Arial", 9))
     status_label.pack(pady=5)
 
-    btn_planilha = tk.Button(root, text="1. Selecionar Planilha", command=lambda: selecionar_planilha(status_label), width=35, bg="#e1f5fe")
+    btn_preparar = tk.Button(root, text="1. Forçar Abertura do Chrome", command=lambda: preparar_chrome(status_label), width=35, bg="#fff9c4")
+    btn_preparar.pack(pady=5)
+
+    btn_planilha = tk.Button(root, text="2. Selecionar Planilha", command=lambda: selecionar_planilha(status_label), width=35, bg="#e1f5fe")
     btn_planilha.pack(pady=5)
 
-    btn_capturar = tk.Button(root, text="2. CAPTURAR REGRA ATUAL", command=lambda: btn_capturar_thread(status_label), width=35, height=2, bg="#c8e6c9", font=("Arial", 9, "bold"))
+    btn_capturar = tk.Button(root, text="3. CAPTURAR REGRA ATUAL", command=lambda: btn_capturar_thread(status_label), width=35, height=2, bg="#c8e6c9", font=("Arial", 9, "bold"))
     btn_capturar.pack(pady=5)
 
     root.mainloop()
