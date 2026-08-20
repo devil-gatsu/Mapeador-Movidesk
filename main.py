@@ -1,169 +1,207 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox
-import threading
+from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 import os
-import time
-from playwright.sync_api import sync_playwright
 
-global_df = None
-global_filepath = ""
+# Variáveis Globais
+df_atual = None
+caminho_atual = ""
+lista_campos = []
+lista_regras = []
 
-def preparar_chrome(status_label):
-    resposta = messagebox.askyesno(
-        "Preparar Navegador", 
-        "Isso vai forçar o encerramento de todos os processos invisíveis do Chrome e abri-lo corretamente para o robô.\n\nSalve o que estiver fazendo no navegador. Deseja continuar?"
-    )
-    if resposta:
-        status_label.config(text="Status: Reiniciando Chrome...", fg="orange")
-        try:
-            # Mata o Chrome de verdade (processos fantasmas)
-            os.system("taskkill /F /IM chrome.exe /T")
-            time.sleep(1.5)
-            # Abre o Chrome já com a porta certa
-            os.system("start chrome.exe --remote-debugging-port=9222")
-            status_label.config(text="Status: Chrome pronto! Pode logar no Movidesk.", fg="green")
-        except Exception as e:
-            messagebox.showerror("Erro", f"Não consegui abrir o Chrome: {e}")
-
-def selecionar_planilha(status_label):
-    global global_df, global_filepath
-    
-    filepath = filedialog.askopenfilename(
-        title="Selecione a planilha de campos",
-        filetypes=[("Arquivos Excel", "*.xlsx *.xls")]
-    )
-    if not filepath:
-        return
-        
+def carregar_dados_memoria(filepath):
+    global df_atual, caminho_atual, lista_campos, lista_regras
     try:
-        global_filepath = filepath
-        global_df = pd.read_excel(filepath)
+        caminho_atual = filepath
+        df_atual = pd.read_excel(filepath)
         
-        while len(global_df.columns) < 4:
-            global_df[f"Coluna_Vazia_{len(global_df.columns)}"] = ""
-            
-        status_label.config(text=f"Status: Planilha carregada! ({len(global_df)} linhas)", fg="green")
+        # Garante colunas mínimas
+        for col in ["Id", "Nome", "Tipo", "Regra de exibição"]:
+            if col not in df_atual.columns:
+                df_atual[col] = ""
+                
+        df_atual["Regra de exibição"] = df_atual["Regra de exibição"].fillna("").astype(str)
+        df_atual["Nome"] = df_atual["Nome"].fillna("").astype(str)
+        
+        # Alimenta o Autocomplete
+        lista_campos = sorted(list(df_atual["Nome"].unique()))
+        todas_regras = df_atual["Regra de exibição"].str.split('\n').explode().str.strip().unique()
+        lista_regras = sorted([r for r in todas_regras if r])
+        
+        lbl_status.config(text=f"Planilha carregada: {os.path.basename(filepath)} ({len(df_atual)} campos)", fg="green")
+        atualizar_comboboxes()
     except Exception as e:
-        status_label.config(text="Status: Erro ao ler planilha.", fg="red")
-        messagebox.showerror("Erro", f"Erro ao ler a planilha:\n{str(e)}")
+        messagebox.showerror("Erro", f"Falha ao carregar: {str(e)}")
 
-def executar_captura(status_label):
-    global global_df, global_filepath
+# ================= FASE 1: CRUZAMENTO =================
+def sincronizar_planilhas():
+    nova_path = filedialog.askopenfilename(title="1. Selecione a Planilha NOVA (Regras Vazias)", filetypes=[("Excel", "*.xlsx")])
+    if not nova_path: return
     
-    if global_df is None:
-        messagebox.showwarning("Aviso", "Selecione a planilha primeiro!")
-        return
-        
-    status_label.config(text="Status: Conectando ao seu Chrome...", fg="orange")
+    antiga_path = filedialog.askopenfilename(title="2. Selecione a Planilha ANTIGA (Regras Preenchidas)", filetypes=[("Excel", "*.xlsx")])
+    if not antiga_path: return
     
     try:
-        with sync_playwright() as p:
-            # Tenta conectar pelo IP explícito para evitar bugs do localhost no Windows
-            try:
-                browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
-            except Exception as e1:
-                try:
-                    browser = p.chromium.connect_over_cdp("http://localhost:9222")
-                except Exception as e2:
-                    raise Exception(f"Erro de Conexão. O Chrome não abriu a porta 9222.\n\nPor favor, clique no Botão 1 para o sistema forçar a abertura correta.\n\nDetalhe do erro: {str(e1)}")
-            
-            context = browser.contexts[0]
-            
-            page = None
-            for p_tab in context.pages:
-                if "movidesk.com" in p_tab.url:
-                    page = p_tab
-                    break
-                    
-            if not page:
-                raise Exception("A conexão deu certo, mas não encontrei a aba do Movidesk aberta!")
+        df_nova = pd.read_excel(nova_path)
+        df_antiga = pd.read_excel(antiga_path)
+        
+        # Cria um dicionário com Nome -> Regra da planilha antiga
+        dict_regras = dict(zip(df_antiga['Nome'], df_antiga['Regra de exibição']))
+        
+        # Mapeia para a nova
+        df_nova['Regra de exibição'] = df_nova['Nome'].map(dict_regras).fillna("")
+        df_nova.to_excel(nova_path, index=False)
+        
+        messagebox.showinfo("Sucesso", "Planilhas cruzadas com sucesso! As regras foram copiadas.")
+        carregar_dados_memoria(nova_path) # Já carrega para a Fase 2
+    except Exception as e:
+        messagebox.showerror("Erro", f"Falha no cruzamento: {str(e)}")
 
-            status_label.config(text="Status: Lendo a tela...", fg="orange")
+# ================= FASE 2: GERENCIADOR (CRUD) =================
+def atualizar_comboboxes():
+    cb_campo['values'] = lista_campos
+    cb_regra['values'] = lista_regras
 
-            nome_regra = page.evaluate("""() => {
-                let inputs = Array.from(document.querySelectorAll('input[type="text"]'));
-                let validInputs = inputs.filter(i => 
-                    i.value.trim() !== '' && 
-                    !i.placeholder.toLowerCase().includes('pesquisar') &&
-                    !i.className.toLowerCase().includes('search')
-                );
-                if (validInputs.length > 0) return validInputs[0].value.trim();
+def autocomplete(event, cb, lista):
+    digitado = cb.get().lower()
+    if digitado == '':
+        cb['values'] = lista
+    else:
+        filtrado = [item for item in lista if str(item).lower().startswith(digitado) or digitado in str(item).lower()]
+        cb['values'] = filtrado
+
+def mudar_interface():
+    acao = var_acao.get()
+    
+    # Esconde tudo primeiro
+    frame_alvo.pack_forget()
+    frame_novo_valor.pack_forget()
+    frame_criar.pack_forget()
+    
+    if acao in ["Excluir", "Alterar"]:
+        frame_alvo.pack(fill="x", pady=5)
+        if acao == "Alterar":
+            frame_novo_valor.pack(fill="x", pady=5)
+    elif acao == "Criar":
+        frame_criar.pack(fill="x", pady=5)
+
+def executar_acao():
+    global df_atual
+    if df_atual is None:
+        messagebox.showwarning("Aviso", "Carregue ou sincronize uma planilha primeiro!")
+        return
+        
+    acao = var_acao.get()
+    alvo = var_alvo.get()
+    campo_atual = cb_campo.get().strip()
+    regra_atual = cb_regra.get().strip()
+    
+    try:
+        if acao == "Excluir":
+            if alvo == "Campo":
+                df_atual = df_atual[df_atual["Nome"] != campo_atual]
+            elif alvo == "Regra":
+                # Limpa a regra específica onde ela existir
+                df_atual["Regra de exibição"] = df_atual["Regra de exibição"].str.replace(regra_atual, "").str.strip()
                 
-                let title = document.querySelector('.k-window-title, h1, h2');
-                if (title) return title.innerText.trim();
+        elif acao == "Alterar":
+            novo_valor = entry_novo_valor.get().strip()
+            if not novo_valor:
+                messagebox.showwarning("Aviso", "Digite o novo valor!")
+                return
                 
-                return "Regra_Desconhecida";
-            }""")
-            
-            if not nome_regra or nome_regra == "":
-                nome_regra = "Regra_Desconhecida"
-
-            textos_brutos = page.locator("body").inner_text().split('\n')
-            textos_tela = [t.strip() for t in textos_brutos if t.strip() != ""]
-
-            coluna_nome = global_df.columns[1] 
-            coluna_alvo = global_df.columns[3] 
-            global_df[coluna_alvo] = global_df[coluna_alvo].fillna("").astype(str)
-            
-            campos_encontrados = 0
-
-            for idx, row in global_df.iterrows():
-                nome_campo_planilha = str(row[coluna_nome]).strip()
+            if alvo == "Campo":
+                df_atual.loc[df_atual["Nome"] == campo_atual, "Nome"] = novo_valor
+            elif alvo == "Regra":
+                df_atual["Regra de exibição"] = df_atual["Regra de exibição"].str.replace(regra_atual, novo_valor)
                 
-                if not nome_campo_planilha or nome_campo_planilha.lower() == "nan":
-                    continue
+        elif acao == "Criar":
+            novo_id = entry_id.get().strip()
+            novo_tipo = entry_tipo.get().strip()
+            if not campo_atual:
+                messagebox.showwarning("Aviso", "Digite o nome do Campo para criar!")
+                return
                 
-                match_encontrado = False
-                for texto_na_tela in textos_tela:
-                    if texto_na_tela == nome_campo_planilha or texto_na_tela.startswith(nome_campo_planilha):
-                        match_encontrado = True
-                        break
-                        
-                if match_encontrado:
-                    valor_atual = str(global_df.at[idx, coluna_alvo]).strip()
-                    
-                    if not valor_atual or valor_atual.lower() == "nan":
-                        global_df.at[idx, coluna_alvo] = nome_regra
-                    else:
-                        lista_regras = [r.strip() for r in valor_atual.split("\n")]
-                        if nome_regra not in lista_regras:
-                            global_df.at[idx, coluna_alvo] = valor_atual + "\n" + nome_regra
-                            
-                    campos_encontrados += 1
-                            
-            global_df.to_excel(global_filepath, index=False)
-            status_label.config(text=f"Status: '{nome_regra[:15]}...' salva! ({campos_encontrados} campos)", fg="green")
+            nova_linha = {"Id": novo_id, "Nome": campo_atual, "Tipo": novo_tipo, "Regra de exibição": regra_atual}
+            df_atual = pd.concat([df_atual, pd.DataFrame([nova_linha])], ignore_index=True)
+
+        # Salva e recarrega
+        df_atual.to_excel(caminho_atual, index=False)
+        carregar_dados_memoria(caminho_atual)
+        messagebox.showinfo("Sucesso", f"Ação '{acao}' realizada e planilha atualizada!")
+        
+        # Limpa os campos
+        cb_campo.set('')
+        cb_regra.set('')
+        entry_novo_valor.delete(0, tk.END)
+        entry_id.delete(0, tk.END)
+        entry_tipo.delete(0, tk.END)
 
     except Exception as e:
-        status_label.config(text="Status: Erro ao capturar.", fg="red")
-        messagebox.showerror("Erro", str(e))
+        messagebox.showerror("Erro", f"Erro ao executar: {str(e)}")
 
-def btn_capturar_thread(status_label):
-    threading.Thread(target=executar_captura, args=(status_label,)).start()
+# ================= INTERFACE GRÁFICA =================
+root = tk.Tk()
+root.title("Gerenciador de Regras Movidesk")
+root.geometry("450x550")
+root.resizable(False, False)
 
-def criar_interface():
-    root = tk.Tk()
-    root.title("Assistente Movidesk")
-    root.geometry("350x230")
-    root.attributes("-topmost", True)
-    root.resizable(False, False)
+# --- Cabeçalho e Fase 1 ---
+tk.Label(root, text="1. Sincronização Inicial", font=("Arial", 10, "bold")).pack(pady=(10, 0))
+tk.Button(root, text="Cruzar Planilha Nova com Antiga", command=sincronizar_planilhas, bg="#e1f5fe").pack(fill="x", padx=20, pady=5)
+tk.Button(root, text="Já tenho a planilha pronta (Carregar)", command=lambda: carregar_dados_memoria(filedialog.askopenfilename()), bg="#fff9c4").pack(fill="x", padx=20)
 
-    tk.Label(root, text="Mapeador Semiautomático - CDP", font=("Arial", 11, "bold")).pack(pady=10)
+lbl_status = tk.Label(root, text="Nenhuma planilha carregada.", fg="red")
+lbl_status.pack(pady=5)
 
-    status_label = tk.Label(root, text="Status: Aguardando...", fg="blue", font=("Arial", 9))
-    status_label.pack(pady=5)
+tk.ttk.Separator(root, orient='horizontal').pack(fill='x', pady=10, padx=10)
 
-    btn_preparar = tk.Button(root, text="1. Forçar Abertura do Chrome", command=lambda: preparar_chrome(status_label), width=35, bg="#fff9c4")
-    btn_preparar.pack(pady=5)
+# --- Fase 2: Gerenciador ---
+tk.Label(root, text="2. Gerenciador (Criar / Alterar / Excluir)", font=("Arial", 10, "bold")).pack(pady=5)
 
-    btn_planilha = tk.Button(root, text="2. Selecionar Planilha", command=lambda: selecionar_planilha(status_label), width=35, bg="#e1f5fe")
-    btn_planilha.pack(pady=5)
+# Ação
+frame_acao = tk.Frame(root)
+frame_acao.pack(pady=5)
+var_acao = tk.StringVar(value="Alterar")
+tk.Radiobutton(frame_acao, text="Alterar", variable=var_acao, value="Alterar", command=mudar_interface).pack(side="left")
+tk.Radiobutton(frame_acao, text="Excluir", variable=var_acao, value="Excluir", command=mudar_interface).pack(side="left")
+tk.Radiobutton(frame_acao, text="Criar", variable=var_acao, value="Criar", command=mudar_interface).pack(side="left")
 
-    btn_capturar = tk.Button(root, text="3. CAPTURAR REGRA ATUAL", command=lambda: btn_capturar_thread(status_label), width=35, height=2, bg="#c8e6c9", font=("Arial", 9, "bold"))
-    btn_capturar.pack(pady=5)
+# Inputs Principais (Com Autocomplete)
+frame_inputs = tk.Frame(root)
+frame_inputs.pack(fill="x", padx=20, pady=5)
+tk.Label(frame_inputs, text="Campo:").pack(anchor="w")
+cb_campo = ttk.Combobox(frame_inputs)
+cb_campo.pack(fill="x")
+cb_campo.bind('<KeyRelease>', lambda e: autocomplete(e, cb_campo, lista_campos))
 
-    root.mainloop()
+tk.Label(frame_inputs, text="Regra:").pack(anchor="w", pady=(5,0))
+cb_regra = ttk.Combobox(frame_inputs)
+cb_regra.pack(fill="x")
+cb_regra.bind('<KeyRelease>', lambda e: autocomplete(e, cb_regra, lista_regras))
 
-if __name__ == "__main__":
-    criar_interface()
+# --- Paineis Dinâmicos (Escondidos/Mostrados via mudar_interface) ---
+frame_alvo = tk.Frame(root)
+tk.Label(frame_alvo, text="O que deseja modificar?").pack(side="left", padx=20)
+var_alvo = tk.StringVar(value="Regra")
+tk.Radiobutton(frame_alvo, text="Campo", variable=var_alvo, value="Campo").pack(side="left")
+tk.Radiobutton(frame_alvo, text="Regra", variable=var_alvo, value="Regra").pack(side="left")
+
+frame_novo_valor = tk.Frame(root)
+tk.Label(frame_novo_valor, text="Novo Valor:").pack(anchor="w", padx=20)
+entry_novo_valor = tk.Entry(frame_novo_valor)
+entry_novo_valor.pack(fill="x", padx=20)
+
+frame_criar = tk.Frame(root)
+tk.Label(frame_criar, text="ID do Campo:").pack(anchor="w", padx=20)
+entry_id = tk.Entry(frame_criar)
+entry_id.pack(fill="x", padx=20)
+tk.Label(frame_criar, text="Tipo do Campo:").pack(anchor="w", padx=20, pady=(5,0))
+entry_tipo = tk.Entry(frame_criar)
+entry_tipo.pack(fill="x", padx=20)
+
+# Botão Executar
+tk.Button(root, text="EXECUTAR AÇÃO", command=executar_acao, bg="#c8e6c9", font=("Arial", 9, "bold")).pack(fill="x", padx=20, pady=15)
+
+mudar_interface() # Inicializa o layout dinâmico
+root.mainloop()
